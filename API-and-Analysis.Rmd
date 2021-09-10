@@ -1,0 +1,168 @@
+---
+title: "API-and-analysis"
+author: "Chloe Wei"
+date: "`r lubridate::today()`"
+output: github_document
+---
+*For this task, I utilized chicago data portal API (https://data.cityofchicago.org/Public-Safety/Crimes-2001-to-Present/ijzp-q8t2) to conduct my analysis. Since it is an open source data, I do not need credentials.*
+
+```{r setup, include = FALSE}
+#Setup globally. To store cache. 
+knitr::opts_chunk$set(cache = TRUE)
+library(tidyverse)
+library(modeldata)
+library(tidymodels)
+library(here)
+library(skimr)
+library(GGally)
+library(factoextra)
+library(patchwork)
+library(httr)
+library(jsonlite)
+library(ggplot2)
+```
+
+## From chicago data portal, I pin-pointed three datasets in use of my chicago elementary education environment analysis. I then perform full_join on the dataset to see the interactive performance of the three datasets.
+```{r get-api}
+url_food <- "https://data.cityofchicago.org/resource/4ijn-s7e5.json"
+res <- GET(url = url_food)
+# clean up the dataframe 
+data_food <- fromJSON(rawToChar(res$content))
+#make tibble of the dataset, no need to simplify them since they are unnested
+df_food <- tibble(data_food) %>%
+  select(zip, name = aka_name) %>%
+  mutate(type = "restaurant") %>%
+  group_by(zip) %>%
+  mutate(count_rest = length(name))
+
+# same steps as above
+url_lib <-"https://data.cityofchicago.org/resource/x8fc-8rcq.json"
+res_lib <-GET(url = url_lib)
+data_lib <- fromJSON(rawToChar(res_lib$content))
+df_lib <- tibble(data_lib) %>%
+  select(zip, name = name_) %>%
+  group_by(zip)%>%
+  mutate(count_lib = length(name))
+  
+
+url_scl <-"https://data.cityofchicago.org/resource/tj8h-mnuv.json"
+res_scl <-GET(url = url_scl)
+data_scl <- fromJSON(rawToChar(res_scl$content))
+df_scl <- tibble(data_scl) %>%
+  select(name = name_of_school, zip = zip_code, safe) %>%
+  mutate(type = "school") %>%
+    filter(safe != "NOT ENOUGH DATA")
+
+full_data <- df_scl %>%
+  # leftjoin school data with library and restaurant data, save in full_data
+  left_join(df_lib, by = "zip") %>%
+  select(-c(name.y,)) %>%
+  left_join(df_food, by = "zip") %>%
+  select(-c(name,type.x,type.y)) %>%
+  unique()
+```
+
+```{r school-safety}
+full_data %>%
+  group_by(zip) %>%
+  ggplot(aes(safe,color = zip, fill = zip)) +
+  #to observe the safety level among different districts
+  geom_bar() +
+  labs(title = "School Safety Level",
+       x = "Safety Level",
+       y = "Count of Various Ranking") +
+  theme(
+    plot.title = element_text(size=13, face="bold", hjust = .5 ),
+    axis.title.x = element_text(size=10, face="bold"),
+    axis.title.y = element_text(size=10, face="bold"))
+```
+## From barplot above, we know that the majority schools are rated neutral in terms of its safety. It is obvious that the majority of schools with very weak safety rate are within the zipcode 60636-60642 (blue areas). Zipcodes above 60624 have the most schools of very strong safety rate. Now let's have a look at whether district with more schools around will have more libraries and restaurants. 
+
+
+```{r school-library-restaurant-plot}
+lib_scl<-full_data %>%
+  group_by(zip) %>%
+  mutate(count_school = length(safe)) %>%
+  ggplot(aes(count_school,count_lib))+
+  ## plot on numbers of school and library
+  geom_point() +
+  geom_smooth() +  
+  labs(title = "School and Libraries Distribution",
+       x = "Number of School",
+       y = "Number of Libraries") +
+  theme(
+    plot.title = element_text(size=13, face="bold", hjust = .5 ),
+    axis.title.x = element_text(size=10, face="bold"),
+    axis.title.y = element_text(size=10, face="bold"))
+
+rr_scl<-full_data %>%
+  group_by(zip) %>%
+  mutate(count_school = length(safe)) %>%
+  #same as above plot
+  ggplot(aes(count_school,count_rest))+
+  geom_point() +
+  geom_smooth() +  
+  labs(title = "School and Restaurant Distribution",
+       x = "Number of School",
+       y = "Number of Restaurant") +
+  theme(
+    plot.title = element_text(size=13, face="bold", hjust = .5 ),
+    axis.title.x = element_text(size=10, face="bold"),
+    axis.title.y = element_text(size=10, face="bold"))
+
+rr_scl + lib_scl
+  
+```
+
+## By the side-by-side plots above, we find a positive indication between school number and library number. However, the linear relationship between school number and restaurants distribution is rather unclear. It is not surprising, since the municipal construction will not suffice too many cormmercial purposes in terms of building a school! Next, we will explore the factors driving the school safety rating using knn model.
+
+```{r school-rating-data}
+df_srr <- tibble(data_scl) %>%
+  #need to retrieve a new data named df_srr, because we de-select a few variables of interests
+    filter(safe != "NOT ENOUGH DATA") %>%
+  mutate(name.x = name_of_school)
+
+final_df <- full_data %>% 
+  left_join(df_srr, by = "name.x") %>%
+  ## select variables of interests
+  select(safe.x,count_lib,count_rest,cps_performance_policy_level,supportive_environment,collaborative_teachers,healthy_schools_certification)  %>%
+  ## change character columns into factor
+  mutate_if(is.character,as.factor) %>%
+  drop_na()
+## check str(final_df)
+```
+
+```{r k=5}
+set.seed(200)
+
+split  <- initial_split(final_df, strata = safe.x, prop = .9)
+train  <- training(split)
+test   <- testing(split)
+
+folds <- vfold_cv(train, v = 10, strata = safe.x)
+
+## knn model setup
+knn_mod <-nearest_neighbor() %>%
+  set_args(neighbors = 5) %>%
+  set_engine("kknn") %>%             
+  set_mode("classification") 
+
+# recoded missing values saved 
+knn_rec <- 
+  recipe(safe.x ~ ., data = final_df) %>%
+  step_novel(all_nominal(), -all_outcomes()) %>% 
+  step_dummy(all_nominal(), -all_outcomes()) %>% 
+  step_zv(all_predictors()) %>% 
+  #make sure all normalized
+  step_normalize(all_numeric()) 
+
+knn_wf <-workflow() %>% 
+  add_recipe(knn_rec) %>% 
+  add_model(knn_mod)
+
+knn_wf %>% 
+  fit_resamples(resamples = folds) %>% 
+  collect_metrics()
+```
+
+## Above knn model reported a relatively low accuracy, meaning we simply cannot come to conclusion with these handful of variables. The implication is that Chicago elementary school rating system does not base too much on internal factors, we can envison that it may relate more to law-enforcement quality in the neighborhood. 
